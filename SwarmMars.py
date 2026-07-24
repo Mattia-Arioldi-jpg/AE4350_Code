@@ -1,3 +1,28 @@
+"""
+Multi-agent stigmergic exploration/sampling simulation over the Jezero Crater DEM.
+
+Overview
+--------
+This script simulates a swarm of aerial "drones" (fast, long-range scouts) and
+ground "rovers" (slow, sample-collecting agents) operating on a real Digital
+Elevation Model (DEM) of Jezero Crater. Coordination between agents is achieved
+through stigmergy: agents read and write values on a shared 2D information
+field instead of communicating directly.
+
+Field value convention (see FIELD PARAMETERS below):
+    - Negative values  -> agent-deposited trails/tracks (decaying over time)
+    - EMPTY (-1.0)     -> untouched terrain
+    - HQ_VAL           -> the lander / home base (frozen, never decays)
+    - >= POI_MIN (0.0) -> an active or exhausted point of interest (POI)
+    - POI_VAL (1.0)    -> a freshly discovered POI, full of samples
+
+Drones explore, discover new POIs, and lay down a trail on their way back to
+HQ. Rovers then follow the trail gradient out to POIs, collect samples, and
+retrace their steps home to deliver them. Over time, unused trails decay
+(modeling aeolian/dust burial), keeping the field responsive to the most
+recently used paths.
+"""
+
 import numpy as np
 import rasterio
 from collections import deque
@@ -15,17 +40,13 @@ import pandas as pd
 import os
 
 
-plt.rcParams.update({
-    "pgf.texsystem": "pdflatex",     # o "xelatex" / "lualatex"
-    "font.family": "serif",
-    "text.usetex": True,
-    "pgf.rcfonts": False,
-})
-
 
 # ───────────────────── DATA LOADING ─────────────────────────
 DEM_PATH = "jezero.tif"
 
+# Three batches of real Mars 2020 (Perseverance) sampling-campaign coordinates
+# (lat, lon in Mars areocentric degrees), grouped by mission phase / region.
+# These are used as realistic POI placements instead of randomly generated ones.
 POI_LIST_1 = [
     (18.42769340, 77.45165066),     # M2020-164-2 Roubion
     (18.43074132, 77.44436502),     # M2020-196-4 Montagnac
@@ -52,17 +73,19 @@ POI_LIST_3 = [
 
 
 # ───────────────────── FIELD PARAMETERS ─────────────────────
+# Stigmergic field value convention: negative = agent trail/track, 0..1 = POI
+# state, HQ_VAL = frozen lander cell. See module docstring for full details.
 EMPTY   = -1.0          # Empty Stigmergic Pixel Value
 HQ_VAL  = -5.0          # Lander Stigmergic Pixel Value
 
 POI_VAL =  1.0          # New Point-of-Interest Stigmergic Pixel Value
 POI_MIN =  0.0          # Exhausted Point-of-Interest Stigmergic Pixel Value
 
-TRAIL_INIT = -0.8       # Drone-Trail Stigmergic Pixel Value
-TRACK_INIT = -0.3       # Rover-Track Stigmergic Pixel Value
-TRAIL_MIN  = -1.0       
+TRAIL_INIT = -0.8       # Drone-Trail Stigmergic Pixel Value (initial deposit)
+TRACK_INIT = -0.3       # Rover-Track Stigmergic Pixel Value (initial deposit, weaker than a drone trail)
+TRAIL_MIN  = -1.0       # Floor value that decay asymptotically approaches
 
-N_POI = 0               # Number of Point-of-Interest
+N_POI = 0               # Number of Point-of-Interest (unused placeholder, kept for reference)
 
 
 # ───────────────────── AGENT PARAMETERS ─────────────────────
@@ -75,21 +98,21 @@ SPEED_ROVER_MPS = 5.0   # [m/s] Rover Speed
 DRONE_BIAS = 1          # Drone determinist movement bias towards nearest POI (0 = random, 1 = deterministic)
 SCAN_RADIUS = 3         # [-] Visible Pixel radius to see new POIs
 
-ROVER_MEMORY = 10000       # Max. Memory of traveled route
+ROVER_MEMORY = 10000       # Max. Memory of traveled route (recently visited cells to avoid, as a deque)
 
 SMPL_DLV_T = 120        # [s] Time needed to deliver sample from rover to lander
 
 
-DRONE_MAX_RANGE_M = 700.0   # [m] Max Range for 1 Flight
-DRONE_RECHARGE_TICKS = 30   # [-] Ticks to recharge
-CHANCE_VAL = 1e-3           # [-] Chance of Finding new POIs when exploring
+DRONE_MAX_RANGE_M = 700.0   # [m] Max Range for 1 Flight before the drone must recharge
+DRONE_RECHARGE_TICKS = 30   # [-] Ticks spent recharging once max range is reached
+CHANCE_VAL = 1e-3           # [-] Per-tick probability of discovering a new POI while exploring
 
 # ─────────────────── SIMULATION PARAMETERS ───────────────────
-SIM_DURATION_S = 100000   # [s] Desired Simulation Time 
+SIM_DURATION_S = 2000   # [s] Desired Simulation Time 
 
 
 ANIM_INTERVAL_MS = 5    # [ms] Animation frame dt
-SAVE_GIF = False        # Flag to save GIF
+SAVE_GIF = True        # Flag to save GIF
 GIF_PATH = "sim.gif"    # GIF path
 
 
@@ -97,6 +120,22 @@ GIF_PATH = "sim.gif"    # GIF path
 # ────────────────────── LOADING PERSEVERANCE DATA ────────────────────────
 
 def latlon_to_dem_km(dem_path, lat, lon):
+    """
+    Convert a Mars areocentric (lat, lon) coordinate into the DEM's projected
+    CRS, expressed in kilometers.
+
+    Parameters
+    ----------
+    dem_path : str
+        Path to the DEM GeoTIFF, used only to read its CRS.
+    lat, lon : float
+        Latitude/longitude in degrees (Mars areocentric sphere).
+
+    Returns
+    -------
+    (x_km, y_km) : tuple of float
+        Projected coordinates in kilometers, in the DEM's own CRS.
+    """
     with rasterio.open(dem_path) as src:
         crs = src.crs
     # Mars areocentric lat/lon
@@ -105,15 +144,18 @@ def latlon_to_dem_km(dem_path, lat, lon):
     x, y = transformer.transform(lon, lat)                                      # attenzione: x=lon, y=lat nell'ordine always_xy
     return x/1000, y/1000  # [km]
 
+# Convert the real Perseverance landing site and its sampling campaigns from
+# lat/lon into the DEM's projected km coordinate system, used throughout the
+# simulation.
 hq_x, hq_y = latlon_to_dem_km("jezero.tif", 18.4447, 77.4508)
 print("HQ_KM =", (hq_x, hq_y))
 HQ_KM = (hq_x, hq_y)                                                                # Perseverance Landing Site
-POI_LIST_KM = [latlon_to_dem_km("jezero.tif", lat, lon) for lat, lon in POI_LIST_3]   # Perseverance POIs
+POI_LIST_KM = [latlon_to_dem_km("jezero.tif", lat, lon) for lat, lon in POI_LIST_1]   # Perseverance POIs
 
-
-# HQ_KM = (4384, 1110)
 
 # ───────────────────────── CROP ─────────────────────────────
+# The full DEM is much larger than needed; crop to a bounding box around HQ
+# and the POIs to keep the simulation grid small and fast.
 CROP_MODE = "km"          # "pixel" | "km" | None
 
 CROP_PIXEL = (500, 800,   # row_min, row_max
@@ -128,11 +170,12 @@ CROP_KM = (min(p[0] for p in all_p)-0.3, max(p[0] for p in all_p)+0.4,    # x_mi
 
 # ────────────────────── AGENT STATES ────────────────────────
 class State(Enum):
-    IDLE      = auto()
-    EXPLORING = auto()
-    RETURNING = auto()
-    SAMPLING  = auto()
-    RECHARGING = auto()
+    """Finite-state-machine states shared by both Drone and Rover agents."""
+    IDLE      = auto()   # Waiting for a trigger (rovers wait for a signal near HQ)
+    EXPLORING = auto()   # Moving outward, searching for / heading to a POI
+    RETURNING = auto()   # Heading back to HQ, depositing a trail/track
+    SAMPLING  = auto()   # Stationary at a POI, collecting a sample
+    RECHARGING = auto()  # Drone-only: grounded after reaching max flight range
 
 STATE_LABEL = {s: s.name[:3] for s in State}                        # State label for visualization purposes
 
@@ -140,6 +183,11 @@ STATE_LABEL = {s: s.name[:3] for s in State}                        # State labe
 
 # ───────────────────────── DEM ──────────────────────────────
 class DEM:
+    """
+    Loads a GeoTIFF elevation raster, optionally crops it to a region of
+    interest, and provides helpers to convert between the raster's pixel
+    grid and its projected coordinate system (in kilometers).
+    """
     def __init__(self, path):
         with rasterio.open(path) as src:
             full  = src.read(1).astype("float32")
@@ -181,6 +229,7 @@ class DEM:
         if nodata is not None:
             self.data[self.data == nodata] = np.nan
     def km_to_pixel(self, x_km, y_km):
+        """Convert projected coordinates (km) to a clipped (row, col) pixel index."""
 
         b = self.bounds
         H, W = self.shape
@@ -194,6 +243,7 @@ class DEM:
         )
 
     def passable(self, r, c):
+        """A cell is passable/traversable if it has valid (non-NaN) elevation data."""
         return not np.isnan(self.data[r, c])
 
 dem = DEM(DEM_PATH)
@@ -204,6 +254,12 @@ SIM_STEPS = int(SIM_DURATION_S / DT)
 
 # ───────────────────────── FIELD ────────────────────────────
 class InfoField:
+    """
+    The shared stigmergic field: a 2D grid overlaid on the DEM that stores
+    trail/track/POI values. Agents read this grid to decide where to go and
+    write to it to leave markers for other agents, instead of communicating
+    directly.
+    """
 
     def __init__(self, dem, hq_km, poi_km_list=None):
 
@@ -238,6 +294,7 @@ class InfoField:
 
     # Used for Prelocated POIs
     def add_poi_km(self, x_km, y_km):
+        """Manually register a POI at the given projected (km) coordinate."""
         r, c = self.dem.km_to_pixel(x_km, y_km)
 
         if self.dem.passable(r, c):
@@ -246,22 +303,29 @@ class InfoField:
 
     # Used when Drones find new POIs
     def mark_poi(self, row, col):
+        """Register a newly discovered POI cell (called by exploring drones)."""
         if not self._frozen[row, col]:
             self.grid[row, col] = POI_VAL
             self.poi.append((row, col))
 
     def deposit_trail(self, row, col):
+        """Lay down a drone trail marker, unless a stronger signal already exists there."""
         if not self._frozen[row, col] and self.grid[row, col] < TRAIL_INIT:                  # and self.grid[row, col] < TRAIL_MIN + 0.05
             self.grid[row, col] = TRAIL_INIT
 
     def decay(self, dt=1.0, rate=1e-5):
+        """
+        Erode all non-frozen, non-POI cells toward TRAIL_MIN at a fixed rate.
+        Models aeolian (wind-driven) burial: unused trails fade over time so
+        that the field favors recently reinforced paths.
+        """
         mask = (~self._frozen) & (self.grid < POI_MIN)
         self.grid[mask] -= rate * dt
         np.clip(self.grid, TRAIL_MIN, None, out=self.grid)
         # self.grid[self.hq_pixel] = HQ_VAL
     
     def neighbors(self, row, col):
-        """Solo i 4 vicini ortogonali (no diagonali)."""
+        """Return the (up to 4) orthogonal neighbor cells within grid bounds."""
         candidates = [
             (row-1, col), (row+1, col),
             (row, col-1), (row, col+1)
@@ -272,6 +336,7 @@ class InfoField:
     def has_signal(self, radius=1):
         """
         True if at least 1 cell with POI or trail exists near HQ.
+        Used to wake up idle rovers once a drone trail reaches home.
         """
         hr, hc = self.hq
         r0, r1 = max(0, hr-radius), min(self.shape[0], hr+radius+1)
@@ -281,15 +346,18 @@ class InfoField:
         return bool(np.any((patch > EMPTY) & (~frozen_patch)))
 
     def sample_poi(self, row, col):
+        """Consume one unit of "sample" value from a POI cell (rover collecting a sample)."""
         if not self._frozen[row, col]:
             self.grid[row, col] -= 0.21
 
     def deposit_track(self, row, col):
+        """Lay down a (weaker) rover track marker, only over non-POI, unmarked cells."""
         if not self._frozen[row, col] and self.grid[row, col] < POI_MIN :                  # and self.grid[row, col] < TRAIL_MIN + 0.05
             self.grid[row, col] = TRACK_INIT
 
     def count_signal_neighbors(self, row, col, exclude=None):
-        """Conta i vicini con campo > EMPTY, escludendo opzionalmente una cella."""
+        """Count neighboring cells with field value > EMPTY, optionally excluding one cell.
+        Used by rovers to detect trail branch points while retreating from a dead end."""
         n = 0
         for rc in self.neighbors(row, col):
             if exclude is not None and rc == exclude:
@@ -299,7 +367,8 @@ class InfoField:
         return n
 
     def erase_pixel(self, row, col):
-        """Riporta una cella a baseline (EMPTY), cancellando trail/track lì."""
+        """Reset a cell back to baseline (EMPTY), removing any trail/track there.
+        Used to prune dead-end branches once a rover backtracks past them."""
         if not self._frozen[row, col]:
             self.grid[row, col] = EMPTY
 
@@ -307,6 +376,7 @@ class InfoField:
 # ── Standard Agent Modes ────────────────────────────────────────────────────────────
 @dataclass
 class Agent:
+    """Base class shared by Drone and Rover, holding position, state, and speed bookkeeping."""
     id:    int                                  # Unique Code
     row:   int                                  # X coordinate
     col:   int                                  # Y coordinate
@@ -366,6 +436,9 @@ class Drone(Agent):
     
     # ── TICK FUNCTION ── gets called for each timestep to check agent state ───
     def tick(self, field: InfoField, dem: DEM):
+        """Advance the drone by one simulation tick, dispatching to the
+        behavior for its current FSM state, then updating traveled distance
+        and triggering a recharge stop once max range is reached."""
         prev_pos = (self.row, self.col)
 
         match self.state:
@@ -392,6 +465,13 @@ class Drone(Agent):
 
     # ── EXPLORATION MODE ─────────────────────────────────────────────────────
     def _explore(self, field: InfoField, dem: DEM, chance=CHANCE_VAL):
+        """
+        One exploration step: take a biased/random walk step toward the
+        current target, roll a small chance of discovering a brand-new POI
+        within the scan radius, then re-scan the local neighborhood to
+        (re)target the closest known POI. Switches to RETURNING once the
+        target is reached.
+        """
         H, W = dem.shape
 
         # 1. Biased Movement
@@ -457,6 +537,9 @@ class Drone(Agent):
             self.target = (pr, pc)
     
     def _levy_step(self, dem):
+        """Generate a Levy-flight-like random step: pick a random direction
+        and hold it for a randomly drawn run length (mix of short and
+        occasional long straight segments), used when no target is set."""
         H, W = dem.shape
 
         if self._levy_remaining <= 0:
@@ -470,6 +553,11 @@ class Drone(Agent):
     
     # ── WALKING FUNCTION ─────────────────────────────────────────────────────
     def _biased_step(self, target: tuple | None, field: InfoField, H: int, W: int):
+        """
+        Compute one movement step: if no target, perform a Levy-flight random
+        walk; otherwise step toward the target with probability `bias`,
+        or take a random step otherwise (noise), then apply and clip position.
+        """
 
         # 1. No Target → random walk
         if target is None:
@@ -494,6 +582,11 @@ class Drone(Agent):
 
     # ── RETURN MODE ─────────────────────────────────────────────────────
     def _return(self, field: InfoField, dem: DEM):
+        """
+        Move one slope-aware step back toward HQ while depositing a trail
+        marker on the current cell. Once at HQ, wait briefly (hq_timer) then
+        switch back to EXPLORING with a freshly chosen active POI target.
+        """
 
         H, W = dem.shape
 
@@ -517,6 +610,14 @@ class Drone(Agent):
             self._slope_aware_step(field.hq, field, dem)   #    # Outputs next movement tile 
 
     def _slope_aware_step(self, target, field, dem):
+        """
+        Move one orthogonal step toward `target`, preferring the neighboring
+        cell with the smallest elevation gradient (gentlest slope) among the
+        candidates that make progress toward the target. Falls back to any
+        passable neighbor, then to an expanding-ring search, if the direct
+        candidates are blocked (used to route drones/rovers around obstacles
+        on the way back to HQ).
+        """
         H, W = dem.shape
 
         if target is None:
@@ -577,6 +678,7 @@ class Drone(Agent):
         cur_elev = dem.data[self.row, self.col]
 
         def slope(cell):
+            """Local elevation gradient magnitude between the current cell and `cell`."""
             r, c = cell
             elev = dem.data[r, c]
             if np.isnan(elev) or np.isnan(cur_elev):
@@ -588,6 +690,9 @@ class Drone(Agent):
         self.move_to(*best)
         
     def _recharge(self, field: InfoField, dem: DEM):
+        """Count down the recharge timer; once done, reset traveled distance
+        and resume whichever state (EXPLORING/RETURNING) the drone was in
+        before it had to land."""
         self.recharge_timer += 1
 
         if self.recharge_timer >= self.recharge_ticks:
@@ -624,6 +729,12 @@ class Rover(Agent):
     
 
     def tick(self, field: InfoField, dem: DEM):
+        """
+        Advance the rover by one simulation tick. Rovers move slower than
+        drones, so ticks are throttled by `tick_ratio` (a rover only actually
+        acts once every `tick_ratio` engine ticks). Dispatches to the
+        behavior for the current FSM state.
+        """
         self._tick_count += 1
         if self._tick_count < self.tick_ratio:
             return               
@@ -649,6 +760,14 @@ class Rover(Agent):
                     self._return(field)
 
     def _follow_gradient(self, field: InfoField):
+        """
+        One exploration step for the rover: prefer any adjacent POI cell; if
+        multiple non-visited signal cells (trail/track) are neighbors,
+        softmax-sample among them weighted by field strength (favoring
+        stronger/fresher trails); if no unvisited signal neighbor exists,
+        treat this as a dead end and start retreating (RETURNING).
+        Also lays down a rover track on the newly occupied cell.
+        """
         self.recent.append((self.row, self.col))
 
         all_neighbors = field.neighbors(self.row, self.col)
@@ -672,6 +791,8 @@ class Rover(Agent):
             self.state = State.SAMPLING
 
         elif meaningful:
+            # Softmax over field strength: favors the strongest nearby signal
+            # while still allowing weaker trails a (smaller) chance.
             values = np.array([field.grid[r, c] for r, c in meaningful])
             beta = 5
             weights = np.exp(beta * (values - values.max()))
@@ -700,6 +821,13 @@ class Rover(Agent):
         field.deposit_track(self.row, self.col)
 
     def _sample(self, field: InfoField):
+        """
+        Stay at the current POI cell, incrementing the sample timer each
+        tick. Once enough ticks have elapsed (del_time / dt / tick_ratio),
+        consume one unit of the POI's value and start returning to HQ
+        carrying the sample. If the POI got exhausted by another rover in
+        the meantime, abandon sampling and return empty-handed.
+        """
         if field.grid[self.row, self.col] >= POI_MIN:
             self.sample_timer += 1
 
@@ -713,6 +841,13 @@ class Rover(Agent):
             self.state = State.RETURNING
 
     def _return(self, field: InfoField):
+        """
+        Retrace the recorded path back toward HQ one cell at a time. If the
+        rover is retreating from a dead end, it also prunes the now-unused
+        branch (erasing pixels) once it reaches a junction with another
+        signal path or reaches HQ. On arrival at HQ, deliver any carried
+        sample after 1 tick, then wait before resuming exploration.
+        """
         prev_pos = (self.row, self.col)
 
         if self.path:
@@ -746,6 +881,11 @@ class Rover(Agent):
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 class Engine:
+    """
+    Owns the DEM, the shared InfoField, and all agents. Drives the
+    simulation forward one tick at a time and accumulates visit-count
+    heatmaps for post-hoc visualization.
+    """
     def __init__(self, dem_path, hq_km):
         self.dem = DEM(dem_path)
         self.field = InfoField(self.dem, hq_km)
@@ -758,6 +898,7 @@ class Engine:
         self.rover_visits = np.zeros(self.dem.shape, dtype=np.int32)
 
     def spawn_poi(self, n):
+        """Randomly place `n` POIs at uniformly sampled passable locations within the DEM extent."""
         for _ in range(n):
             x_km = random.uniform(
                 self.dem.bounds.left / 1000,
@@ -773,6 +914,7 @@ class Engine:
         print(f"[Engine] {n} POI generated.")
 
     def spawn_drones(self, n, scan_radius, bias):
+        """Create `n` Drone agents at HQ, all starting in the EXPLORING state."""
         hq = self.field.hq
         for i in range(n):
             d = Drone(
@@ -790,6 +932,7 @@ class Engine:
         print(f"[Engine] {n} Drones Created.")
 
     def spawn_rovers(self, n, memory=ROVER_MEMORY):
+        """Create `n` Rover agents at HQ, all starting in the IDLE state (waiting for a drone trail)."""
         hq = self.field.hq
 
         for i in range(n):
@@ -808,6 +951,7 @@ class Engine:
         print(f"[Engine] {n} Rovers Created (memory={memory}).")
 
     def step(self, dt):
+        """Advance every agent by one tick, update visit heatmaps, then decay the field."""
         for d in self.drones:
             d.tick(self.field, self.dem)
             self.drone_visits[d.row, d.col] += 1
@@ -821,6 +965,12 @@ class Engine:
 # ─────────────── ANIMATION ───────────────
 
 def animate(engine: Engine, steps: int, interval_ms: int, save_path: str | None):
+    """
+    Run and animate the simulation live using matplotlib's FuncAnimation:
+    DEM as a base map, the stigmergic field as a semi-transparent overlay,
+    and drone/rover markers with state labels updated every frame.
+    Optionally saves the animation as a GIF if `save_path` is given.
+    """
     fig, ax = plt.subplots(figsize=(11, 7))
     fig.patch.set_facecolor("#0d0d0d")
     ax.set_facecolor("#0d0d0d")
@@ -899,6 +1049,7 @@ def animate(engine: Engine, steps: int, interval_ms: int, save_path: str | None)
     ax.tick_params(colors="white")
 
     def update(frame):
+        """Advance the simulation by one step and refresh all plotted artists."""
         engine.step(DT)
 
         im.set_data(engine.field.grid)
@@ -946,7 +1097,7 @@ def animate(engine: Engine, steps: int, interval_ms: int, save_path: str | None)
     plt.show()
     return anim
 
-# ── Animation Main ───────────────────────────────────────────────────────-
+
 # if __name__ == "__main__":
 #     engine = Engine(DEM_PATH, HQ_KM)
 #     engine.field = InfoField(engine.dem, HQ_KM, poi_km_list=POI_LIST_KM)
@@ -979,6 +1130,11 @@ def plot_final_state(engine: Engine, dem: DEM, poi_batch_name: str = "POI_LIST",
     \\linewidth in the LaTeX document. Uses manual margins instead of
     constrained_layout so fontsize is never silently compressed, and disables
     scientific-notation axis offsets (which don't scale with tick fontsize).
+
+    Produces (and saves to `output_dir`):
+      1. final_state_<name>.pdf     -- DEM + final POI states + HQ
+      2. drone_coverage_<name>.pdf  -- DEM + drone visit-count heatmap
+      3. rover_coverage_<name>.pdf  -- DEM + rover visit-count heatmap
     """
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -1155,6 +1311,7 @@ def plot_combined_overview(engine: Engine, dem: DEM, poi_batch_name: str = "POI_
     - Rover coverage heatmap (viridis)
     - POI markers (active / sampled) and HQ
     All information in one plot, with two separate colorbars for drone/rover density.
+    Also auto-crops the view to the region actually explored by the agents.
     """
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -1418,7 +1575,8 @@ def run_and_combine_batches(dem_path, hq_km, poi_lists_km, batch_labels=None,
     rover_hm = np.where(rover_total > 0, rover_total, np.nan)
     
     
-    # Espande ogni pixel su un intorno 3x3
+    # Espande ogni pixel su un intorno 3x3 (rende la heatmap più leggibile
+    # a bassa risoluzione, evitando puntini isolati poco visibili)
     drone_hm = maximum_filter(drone_hm, size=11)
     rover_hm = maximum_filter(rover_hm, size=11)
     
@@ -1490,22 +1648,23 @@ def run_and_combine_batches(dem_path, hq_km, poi_lists_km, batch_labels=None,
     return combined_path, engines
 
 
-if __name__ == "__main__":
-    engine = Engine(DEM_PATH, HQ_KM)
-    engine.field = InfoField(engine.dem, HQ_KM, poi_km_list=POI_LIST_KM)   # nessun POI iniziale
-    engine.spawn_drones(N_DRONES, scan_radius=SCAN_RADIUS, bias=DRONE_BIAS)
-    engine.spawn_rovers(N_ROVERS)
+# if __name__ == "__main__":
+#     # ── Single full simulation run using the real Perseverance POI batch 3 ──
+#     engine = Engine(DEM_PATH, HQ_KM)
+#     engine.field = InfoField(engine.dem, HQ_KM, poi_km_list=POI_LIST_KM)   # nessun POI iniziale
+#     engine.spawn_drones(N_DRONES, scan_radius=SCAN_RADIUS, bias=DRONE_BIAS)
+#     engine.spawn_rovers(N_ROVERS)
 
-    for tick in range(SIM_STEPS):
-        engine.step(DT)
+#     for tick in range(SIM_STEPS):
+#         engine.step(DT)
 
-        if engine.field.poi and all_samples_delivered(engine):
-            print(f"[Main] All samples delivered at tick {tick} "
-                  f"(t={tick * DT:.0f} s). Stopping simulation early.")
-            break
+#         if engine.field.poi and all_samples_delivered(engine):
+#             print(f"[Main] All samples delivered at tick {tick} "
+#                   f"(t={tick * DT:.0f} s). Stopping simulation early.")
+#             break
 
-    print(f"Simulation finished, Samples Delivered: {engine.field.total_delivered}")
-    plot_combined_overview(engine, engine.dem, poi_batch_name="Random", output_dir="results")
+#     print(f"Simulation finished, Samples Delivered: {engine.field.total_delivered}")
+#     plot_combined_overview(engine, engine.dem, poi_batch_name="Random", output_dir="results")
     
 
 
@@ -1528,6 +1687,11 @@ poi_batch_3_km = [latlon_to_dem_km(DEM_PATH, lat, lon) for lat, lon in POI_LIST_
 # ─────────────── METRICS TRACKING ───────────────
 
 class Metrics:
+    """
+    Collects per-tick statistics from an Engine over the course of a run
+    (delivered samples, POIs discovered, per-state tick counts, coverage,
+    dead-end events) and produces a summary dict at the end.
+    """
     def __init__(self, engine):
         self.engine = engine
         self.delivered_over_time = []
@@ -1540,6 +1704,7 @@ class Metrics:
         self.poi_delivered_tick = [] # latenza consegna
 
     def sample(self, tick):
+        """Record one tick's worth of engine state into the running metrics."""
         eng = self.engine
         self.delivered_over_time.append(eng.field.total_delivered)
         self.poi_discovered_over_time.append(len(eng.field.poi))
@@ -1560,6 +1725,9 @@ class Metrics:
                 self.deadend_count += 1
 
     def summary(self, dt, dem):
+        """Aggregate the collected samples into a single summary dict
+        (throughput, coverage fraction, time to first delivery, per-state
+        fraction of ticks spent by drones/rovers, etc.)."""
         eng = self.engine
         total_ticks = len(self.delivered_over_time)
         total_time_s = total_ticks * dt
@@ -1584,6 +1752,11 @@ class Metrics:
 
 def run_headless_with_metrics(seed, steps=SIM_STEPS, poi_list=POI_LIST_KM,
                                early_stop=True, verbose=True):
+    """
+    Run one full simulation (no plotting) with a fixed random seed,
+    collecting Metrics along the way. Optionally stops early once all
+    samples have been delivered. Returns (summary_dict, Metrics instance).
+    """
     np.random.seed(seed)
     random.seed(seed)
     engine = Engine(DEM_PATH, HQ_KM)
@@ -1615,8 +1788,13 @@ def run_headless_with_metrics(seed, steps=SIM_STEPS, poi_list=POI_LIST_KM,
 
     return summary, metrics
 
-
 def multi_run(n_seeds=10, steps=SIM_STEPS, early_stop=True):
+    """
+    Run `n_seeds` independent headless simulations (seeds 0..n_seeds-1),
+    print aggregate statistics (mean +/- std of delivered samples,
+    throughput, coverage, early-stop rate), and return the list of
+    per-run summary dicts.
+    """
     results = []
     for seed in range(n_seeds):
         summary, _ = run_headless_with_metrics(seed, steps, early_stop=early_stop)
@@ -1650,6 +1828,7 @@ def plot_dem_with_batches(dem_path, hq_km, poi_batches, batch_labels=None,
     """
     Plots the DEM with the HQ (lander) location and multiple POI batches,
     each shown with a distinct color/marker. Light theme.
+    Used to illustrate the experimental setup before running a simulation.
     """
     dem = DEM(dem_path)
     b = dem.bounds
