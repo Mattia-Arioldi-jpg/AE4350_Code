@@ -31,7 +31,7 @@ You will also need a working **LaTeX installation** (`pdflatex`) on your system 
 
 ## Data
 
-The DEM file `jezero.tif` is **not included** in this repository due to file size. It can be obtained from [[https://planetarymaps.usgs.gov/mosaic/mars2020_trn/CTX/ScienceInvestigationMaps_JPL/M20_JezeroCrater_CTXDEM_20m.tif](url)]. Place it in the repository root before running any script.
+The DEM file `jezero.tif` is **not included** in this repository due to file size. It can be obtained from [https://planetarymaps.usgs.gov/mosaic/mars2020_trn/CTX/ScienceInvestigationMaps_JPL/M20_JezeroCrater_CTXDEM_20m.tif]. Place it in the repository root before running any script.
 
 ## Usage
 
